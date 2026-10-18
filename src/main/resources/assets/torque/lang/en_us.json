@@ -1,0 +1,13 @@
+{
+  "itemGroup.torque": "Example Mod Tab",
+  "block.torque.example_block": "Example Block",
+  "item.torque.example_item": "Example Item",
+
+  "torque.configuration.title": "Torque Configs",
+  "torque.configuration.section.torque.common.toml": "Torque Configs",
+  "torque.configuration.section.torque.common.toml.title": "Torque Configs",
+  "torque.configuration.items": "Item List",
+  "torque.configuration.logDirtBlock": "Log Dirt Block",
+  "torque.configuration.magicNumberIntroduction": "Magic Number Text",
+  "torque.configuration.magicNumber": "Magic Number"
+}
