@@ -8,32 +8,41 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.model.geom.ModelPart;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
+import net.minecraft.util.Ease;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.HumanoidArm;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import org.joml.Quaternionf;
 
 /**
  * 把 {@link AnimationLibrary} 里的 Bedrock 动画接到模组的骨骼上。
  *
- * <p><b>状态</b>：五路权重叠加，总和恒为 1——静止播 {@code idle}、走路 {@code walk}、冲刺 {@code run}、
- * 潜行 {@code sneak}、潜行移动 {@code sneak_walk}：
+ * <p><b>状态</b>：七路权重叠加，总和恒为 1——静止播 {@code idle}、走路 {@code walk}、冲刺 {@code run}、
+ * 潜行 {@code sneak}、潜行移动 {@code sneak_walk}、鞘翅滑翔 {@code fly}、创造飞行 {@code hover}：
  *
  * <pre>
- * idle       = (1 - move) · (1 - sneak)
- * walk       = move · (1 - sneak) · (1 - run)
- * run        = move · (1 - sneak) · run
- * sneak      = (1 - move) · sneak
- * sneak_walk = move · sneak
+ * ground     = (1 - fly) · (1 - hover)
+ * idle       = (1 - move) · (1 - sneak) · ground
+ * walk       = move · (1 - sneak) · (1 - run) · ground
+ * run        = move · (1 - sneak) · run · ground
+ * sneak      = (1 - move) · sneak · ground
+ * sneak_walk = move · sneak · ground
+ * fly        = fly
+ * hover      = hover
  * </pre>
  *
  * 每个权重都是连续量（移动程度、潜行程度、跑步程度都按 tick 记录、按 {@code partialTick} 插值），
- * 所以状态切换是渐变，不会硬切。
+ * 所以状态切换是渐变，不会硬切。飞行是两路互斥的覆盖状态，接管时地面五路整体退到后面。
+ *
+ * <p><b>挥臂</b>：{@code animation.swing} 只提供手肘那点弯曲，手臂的挥动本身仍是原版
+ * {@code setupAttackAnimation} 的增量，叠加在混合好的姿态上（见 {@link #addSwingArm}）。
  *
  * <p><b>时间</b>：动画本身是连续曲线（{@link AnimationChannel#sample} 每个渲染帧求值），没有"帧"的概念。
  * {@code Entity#moveDist} 每 tick 才累加一次，所以额外补上"这一 tick 已经走了多远 × partialTick"，
- * 一个动画循环 = 两声脚步 = {@code moveDist} +2。
+ * 一个动画循环 = 两声脚步 = {@code moveDist} +2。待机 / 潜行 / 飞行是原地动作，按真实时间走。
  *
  * <p><b>坐标系</b>：动画是 Blockbench / Bedrock 的（Y 向上、Z 轴朝后、右臂在 +X），模型部件是
  * Minecraft 的（Y 向下、Z 轴同样朝后、右臂在 -X）——两者差 180° 绕 Z：X、Y 取反、Z 同向。
@@ -54,6 +63,12 @@ public final class AnimationBridge {
     private static final String SNEAK = "animation.sneak";
     /** 潜行移动 */
     private static final String SNEAK_WALK = "animation.sneak_walk";
+    /** 鞘翅滑翔（fall flying） */
+    private static final String FLY = "animation.fly";
+    /** 创造飞行 / 悬浮 */
+    private static final String HOVER = "animation.hover";
+    /** 玩家挥臂（攻击）的手肘弯曲 */
+    private static final String SWING = "animation.swing";
 
     /**
      * walkAnimationSpeed 要放到多大才算"完全在动"。
@@ -81,6 +96,8 @@ public final class AnimationBridge {
     /** 采样暂存，渲染线程单线程访问 */
     private static final float[] SCRATCH = new float[3];
     private static final float[] SCRATCH_OUT = new float[3];
+    /** 挥臂动画的采样暂存，和常规混合分开，避免互相覆盖 */
+    private static final float[] SWING_SCRATCH = new float[3];
 
     /** 权重每 tick 逼近目标值的比例：越小越柔和（0.35 ≈ 8 tick，约 0.4 秒收敛） */
     private static final float SMOOTH_STEP = 0.35F;
@@ -91,10 +108,12 @@ public final class AnimationBridge {
     private static long DEBUG_LEG_AT = 0L;
     private static long DEBUG_WALK_AT = 0L;
 
-    /** 两路需要平滑的权重，按实体分开记录 */
+    /** 需要平滑的权重，按实体分开记录 */
     private static final SmoothWeight MOVE_WEIGHT = new SmoothWeight(SMOOTH_STEP);
     private static final SmoothWeight RUN_WEIGHT = new SmoothWeight(SMOOTH_STEP);
     private static final SmoothWeight SNEAK_WEIGHT = new SmoothWeight(SMOOTH_STEP);
+    private static final SmoothWeight FLY_WEIGHT = new SmoothWeight(SMOOTH_STEP);
+    private static final SmoothWeight HOVER_WEIGHT = new SmoothWeight(SMOOTH_STEP);
 
     private AnimationBridge() {
     }
@@ -152,9 +171,125 @@ public final class AnimationBridge {
         return state.isCrouching ? 1.0F : 0.0F;
     }
 
+    /**
+     * 0..1：鞘翅滑翔占的比重。
+     *
+     * <p>用渲染状态里的 {@code isFallFlying}（客户端已经按实体同步过来），远距离玩家也能判断；
+     * 和其他状态一样走 {@link SmoothWeight}，起翅 / 收翅不会硬切。
+     */
+    public static float flyWeight(AvatarRenderState state) {
+        Entity entity = entity(state);
+        float target = state.isFallFlying ? 1.0F : 0.0F;
+        return entity == null ? target : smooth(FLY_WEIGHT, state, entity, target);
+    }
+
+    /**
+     * 0..1：创造飞行（悬浮）占的比重。
+     *
+     * <p>{@code AvatarRenderState} 不带"正在创造飞行"的字段，只能问实体：玩家能力里的
+     * {@code flying}。旁观者不渲染模型，顺手排掉；滑翔时即使能力开着也以滑翔为准。
+     */
+    public static float hoverWeight(AvatarRenderState state) {
+        Entity entity = entity(state);
+        boolean flying = entity instanceof Player player
+            && !player.isSpectator()
+            && !state.isFallFlying
+            && player.getAbilities().flying;
+        return entity == null ? 0.0F : smooth(HOVER_WEIGHT, state, entity, flying ? 1.0F : 0.0F);
+    }
+
     /** 把目标值交给 {@link SmoothWeight} 过渡 */
     private static float smooth(SmoothWeight weight, AvatarRenderState state, Entity entity, float target) {
         return weight.value(entity.getId(), entity.tickCount, state.partialTick, target);
+    }
+
+    // ------------------------------------------------------------------ 挥臂
+
+    /** 玩家当前是否在挥臂（原版挥臂期间，滑翔时不挥）。 */
+    public static boolean swingActive(AvatarRenderState state) {
+        return state.attackTime > 0.0F && !state.isFallFlying;
+    }
+
+    /** 这条骨骼是不是当前攻击手的前臂、并且正在挥臂 */
+    private static boolean swingActive(AvatarRenderState state, String bone) {
+        if (!swingActive(state)) {
+            return false;
+        }
+
+        if ("rightForearm".equals(bone)) {
+            return state.attackArm == HumanoidArm.RIGHT;
+        }
+
+        if ("leftForearm".equals(bone)) {
+            return state.attackArm == HumanoidArm.LEFT;
+        }
+
+        return false;
+    }
+
+    /** 原版挥臂给躯干的扭身增量（{@code setupAttackAnimation} 里那段），叠加在动画姿态上 */
+    public static void addSwingBody(ModelPart body, AvatarRenderState state) {
+        if (swingActive(state)) {
+            body.yRot += swingBodyYaw(state);
+        }
+    }
+
+    /**
+     * 把原版的挥臂增量叠加到手臂上，而不是替换掉动画姿态。
+     *
+     * <p>原版 {@code setupAttackAnimation} 是直接改写手臂姿态，模组如果整条跳过混合，
+     * 潜行 / 走路时手臂就会瞬移到「站立 + 原版挥臂」的位置，挥完再传回来。这里只把原版那段旋转增量
+     * 加在已经混合好的姿态上，潜行姿态、走路摆动都保留；原版那 5 像素的位置偏移是给直筒手臂的，
+     * 搬到这套更粗的肢体上会明显离开身体，所以位置不动。
+     */
+    public static void addSwingArm(ModelPart part, AvatarRenderState state, String bone) {
+        if (!swingActive(state)) {
+            return;
+        }
+
+        boolean right = "rightArm".equals(bone);
+        boolean left = "leftArm".equals(bone);
+        if (!right && !left) {
+            return;
+        }
+
+        if ((state.attackArm == HumanoidArm.RIGHT) != right) {
+            return;
+        }
+
+        float attackTime = state.attackTime;
+        float bodyYaw = swingBodyYaw(state);
+
+        // 挥动旋转（原版 WHACK 分支）：xRot 前挥、yRot 跟着扭身、zRot 带一点侧摆
+        float swing = Ease.outQuart(attackTime);
+        float arc = Mth.sin(swing * (float) Math.PI);
+        float look = Mth.sin(attackTime * (float) Math.PI) * -(float) (Math.toRadians(state.xRot) - 0.7F) * 0.75F;
+        part.xRot -= arc * 1.2F + look;
+        part.yRot += bodyYaw * 2.0F;
+        part.zRot += Mth.sin(attackTime * (float) Math.PI) * -0.4F;
+    }
+
+    /** 原版挥臂的扭身角：{@code body.yRot} 的目标值 */
+    private static float swingBodyYaw(AvatarRenderState state) {
+        float yaw = Mth.sin(Mth.sqrt(state.attackTime) * (float) (Math.PI * 2.0)) * 0.2F;
+        return state.attackArm == HumanoidArm.LEFT ? -yaw : yaw;
+    }
+
+    /** 按挥动进度采样挥臂动画写进 {@code out}；没加载到动画或没有这条骨骼时返回 false */
+    private static boolean swingAngles(AvatarRenderState state, String bone, float[] out) {
+        BedrockAnimation animation = AnimationLibrary.INSTANCE.get(SWING);
+        if (animation == null) {
+            return false;
+        }
+
+        AnimationChannel channel = animation.bone(bone).rotation();
+        if (channel.isEmpty()) {
+            return false;
+        }
+
+        // attackTime 从 1 递减到 0，换算成 0 → 1 的进度再乘动画长度
+        channel.sample((1.0F - state.attackTime) * animation.length(), out, false);
+        return true;
     }
 
     /**
@@ -204,10 +339,10 @@ public final class AnimationBridge {
      * 动画当前时间（秒）。
      *
      * <p>移动类动画按走过的距离走（{@code moveDist}），这样循环和脚步声咬合；
-     * 但待机和潜行是原地不动的，用距离驱动会在松手瞬间冻住，所以它们改按真实时间走。
+     * 但待机 / 潜行 / 飞行是原地动作，用距离驱动会在松手瞬间冻住，所以它们改按真实时间走。
      */
     private static float time(AvatarRenderState state, BedrockAnimation animation, String name) {
-        if (IDLE.equals(name) || SNEAK.equals(name)) {
+        if (IDLE.equals(name) || SNEAK.equals(name) || FLY.equals(name) || HOVER.equals(name)) {
             return animation.wrap(state.ageInTicks / 20.0F);
         }
 
@@ -235,33 +370,38 @@ public final class AnimationBridge {
     // ------------------------------------------------------------------ 采样
 
     /**
-     * 五种状态的权重，由三个连续量组合出来，总和恒为 1。
+     * 七种状态的权重，由五个连续量组合出来，总和恒为 1。
      *
-     * <p>加新状态时只改这里：把它的权重表达式写进来、在 {@link #sample} 里多接一路动画即可。
+     * <p>飞行是两路互斥的覆盖状态：鞘翅滑翔和创造飞行一旦接管，地面上的五种状态整体乘
+     * {@code (1 - fly) · (1 - hover)} 退到后面，这样起翅 / 落地都是连续的混合，而不是硬切。
+     * 加新状态时只改这里：把它的权重表达式写进来、在 {@link #sample} 里多接一路动画即可。
      */
-    private record Weights(float idle, float walk, float run, float sneak, float sneakWalk) {
-        static Weights of(float move, float run, float sneak) {
+    private record Weights(float idle, float walk, float run, float sneak, float sneakWalk, float fly, float hover) {
+        static Weights of(float move, float run, float sneak, float fly, float hover) {
+            float ground = (1.0F - fly) * (1.0F - hover);
             return new Weights(
-                (1.0F - move) * (1.0F - sneak),
-                move * (1.0F - sneak) * (1.0F - run),
-                move * (1.0F - sneak) * run,
-                (1.0F - move) * sneak,
-                move * sneak
+                (1.0F - move) * (1.0F - sneak) * ground,
+                move * (1.0F - sneak) * (1.0F - run) * ground,
+                move * (1.0F - sneak) * run * ground,
+                (1.0F - move) * sneak * ground,
+                move * sneak * ground,
+                fly,
+                hover
             );
         }
     }
 
     /**
-     * 把五路动画在 bone 上采样后混合，结果写进 {@link #SCRATCH_OUT}。
+     * 把七路动画在 bone 上采样后混合，结果写进 {@link #SCRATCH_OUT}。
      *
-     * <p>五路权重之和恒为 1，所以这里直接相加就是加权平均——<b>不要再按"实际有数据的权重"重归一化</b>。
+     * <p>七路权重之和恒为 1，所以这里直接相加就是加权平均——<b>不要再按"实际有数据的权重"重归一化</b>。
      * 某个动画没写这根骨骼（比如 idle 的腿就是故意留空的）时，它应该贡献 0、把权重让给别的状态；
      * 重新归一化会把剩下那一点点权重的动画放大成 100%，典型症状就是松开潜行后腿一直卡在潜行的角度上。
      *
      * @return 有没有任何一路真正贡献了数据（没加载到动画时返回 false，调用方就保持原版姿态）
      */
     private static boolean sample(AvatarRenderState state, String bone, boolean rotation) {
-        Weights weights = Weights.of(weight(state), runWeight(state), sneakWeight(state));
+        Weights weights = Weights.of(weight(state), runWeight(state), sneakWeight(state), flyWeight(state), hoverWeight(state));
 
         SCRATCH_OUT[0] = 0.0F;
         SCRATCH_OUT[1] = 0.0F;
@@ -273,13 +413,15 @@ public final class AnimationBridge {
         total += addChannel(state, RUN, bone, weights.run(), rotation);
         total += addChannel(state, SNEAK, bone, weights.sneak(), rotation);
         total += addChannel(state, SNEAK_WALK, bone, weights.sneakWalk(), rotation);
+        total += addChannel(state, FLY, bone, weights.fly(), rotation);
+        total += addChannel(state, HOVER, bone, weights.hover(), rotation);
 
         if (DEBUG && System.currentTimeMillis() - DEBUG_AT > 2000L) {
             DEBUG_AT = System.currentTimeMillis();
             com.zszq.torque.Torque.LOGGER.info(
-                "[torque] bone={} idle={} walk={} run={} sneak={} sneakWalk={} -> {},{},{} total={}",
+                "[torque] bone={} idle={} walk={} run={} sneak={} sneakWalk={} fly={} hover={} -> {},{},{} total={}",
                 bone, weights.idle(), weights.walk(), weights.run(), weights.sneak(), weights.sneakWalk(),
-                SCRATCH_OUT[0], SCRATCH_OUT[1], SCRATCH_OUT[2], total
+                weights.fly(), weights.hover(), SCRATCH_OUT[0], SCRATCH_OUT[1], SCRATCH_OUT[2], total
             );
         }
 
@@ -322,7 +464,7 @@ public final class AnimationBridge {
      */
     public static void blendRotation(ModelPart part, AvatarRenderState state, String bone) {
         if (!sample(state, bone, true)) {
-            // 五路动画都没有这根骨骼的数据：归零，别让原版 setupAnim 的残留角度把动作卡在最后一帧
+            // 七路动画都没有这根骨骼的数据：归零，别让原版 setupAnim 的残留角度把动作卡在最后一帧
             part.xRot = 0.0F;
             part.yRot = 0.0F;
             part.zRot = 0.0F;
@@ -369,7 +511,15 @@ public final class AnimationBridge {
     public static void applyBodyAndHead(ModelPart body, ModelPart head, AvatarRenderState state) {
         blendRotation(body, state, "body");
         blendPosition(body, state, "body");
+        // 在动画姿态上叠加原版挥臂的扭身，而不是丢掉动画姿态
+        addSwingBody(body, state);
 
+        // 原版滑翔会把 head.xRot 硬设成 -π/4，替掉视线俯仰；这里按滑翔权重插回视线角度，
+        // 让头继续跟随视角（yRot 原版本来就保留视线），动画的 head 通道再叠在上面。
+        float fly = flyWeight(state);
+        if (fly > 0.0F) {
+            head.xRot = Mth.lerp(fly, head.xRot, (float) Math.toRadians(state.xRot));
+        }
         addRotation(head, state, "head");
         blendPosition(head, state, "head");
     }
@@ -402,13 +552,20 @@ public final class AnimationBridge {
      *
      * <p>只从资源包的动画里取，模组自己不硬编码任何动作：没有动画就伸直（0）。
      * json 里写的是 Blockbench 的数值，取反之后才是模型空间里的角度（见类注释）。
+     * 挥臂时再把前臂的弯曲增量叠上去（{@code animation.swing} 只写这两根骨骼）。
      */
     public static float joint(AvatarRenderState state, String bone) {
-        if (!sample(state, bone, true)) {
-            return 0.0F;
+        float angle = 0.0F;
+        if (sample(state, bone, true)) {
+            angle = -SCRATCH_OUT[0];
         }
 
-        return (float) Math.toRadians(-SCRATCH_OUT[0]);
+        // 挥臂时把前臂的挥动叠到关节角上（sample 用 SCRATCH_OUT，这里用独立的 SWING_SCRATCH）
+        if (swingActive(state, bone) && swingAngles(state, bone, SWING_SCRATCH)) {
+            angle += -SWING_SCRATCH[0] * state.attackTime;
+        }
+
+        return (float) Math.toRadians(angle);
     }
 
     /**
@@ -425,15 +582,13 @@ public final class AnimationBridge {
     }
 
     /**
-     * 披风根部的朝向：静止时用原版那套飘逸；一旦在动、或者在潜行，就淡出成只有朝背后的 180°，
+     * 披风根部的朝向：静止时用原版那套飘逸；一旦在动、潜行或者飞行，就淡出成只有朝背后的 180°，
      * 这样披风的表现严格等于资源包里的数值，不会被原版的 capeFlap / capeLean 盖过去。
-     *
-     * <p>潜行必须算进来：蹲着不动时 {@code move} 是 0，只看它的话潜行披风会退回原版飘逸，
-     * 和 Blockbench 里摆的那套角度对不上。
      */
     public static void applyCapeBase(PoseStack poseStack, AvatarRenderState state) {
         Quaternionf vanilla = vanillaCapeRotation(state);
-        float move = Math.max(weight(state), sneakWeight(state));
+        // 飞行时披风完全交给动画（fly / hover 都有自己的披风通道），原版的 capeFlap / capeLean 必须淡出
+        float move = Math.max(Math.max(weight(state), sneakWeight(state)), Math.max(flyWeight(state), hoverWeight(state)));
         if (move <= 0.001F) {
             poseStack.mulPose(vanilla);
             return;

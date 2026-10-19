@@ -49,8 +49,10 @@ public class TorquePlayerModel extends PlayerModel {
         // 所以这里不需要再补父子关系；这些部件本身是隐藏的，但它们的姿态是 BentLimbLayer 画弯曲肢体的坐标来源
         AnimationBridge.blendRotation(this.rightArm, state, "rightArm");
         AnimationBridge.blendPosition(this.rightArm, state, "rightArm");
+        AnimationBridge.addSwingArm(this.rightArm, state, "rightArm");
         AnimationBridge.blendRotation(this.leftArm, state, "leftArm");
         AnimationBridge.blendPosition(this.leftArm, state, "leftArm");
+        AnimationBridge.addSwingArm(this.leftArm, state, "leftArm");
         AnimationBridge.blendRotation(this.rightLeg, state, "rightLeg");
         AnimationBridge.blendPosition(this.rightLeg, state, "rightLeg");
         AnimationBridge.blendRotation(this.leftLeg, state, "leftLeg");

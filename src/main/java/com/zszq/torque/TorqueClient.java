@@ -4,6 +4,7 @@ import com.zszq.torque.client.animation.AnimationLibrary;
 import com.zszq.torque.client.layer.BentArmorLayer;
 import com.zszq.torque.client.layer.BentCapeLayer;
 import com.zszq.torque.client.layer.BentLimbLayer;
+import com.zszq.torque.client.layer.TorqueWingsLayer;
 import com.zszq.torque.client.model.TorqueArmorModel;
 import com.zszq.torque.client.model.TorquePlayerModel;
 import java.util.List;
@@ -16,8 +17,10 @@ import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.renderer.entity.ArmorModelSet;
 import net.minecraft.client.renderer.entity.EntityRendererProvider;
 import net.minecraft.client.renderer.entity.layers.CapeLayer;
+import net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer;
 import net.minecraft.client.renderer.entity.layers.HumanoidArmorLayer;
 import net.minecraft.client.renderer.entity.layers.RenderLayer;
+import net.minecraft.client.renderer.entity.layers.WingsLayer;
 import net.minecraft.client.renderer.entity.player.AvatarRenderer;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
 import net.minecraft.resources.Identifier;
@@ -84,6 +87,7 @@ public class TorqueClient {
                 useBentArmorModels(renderer, models);
                 renderer.addLayer(new BentArmorLayer(renderer, event.getContext()));
                 useBentCape(renderer, event.getContext());
+                useWingsLayer(renderer, models, event.getContext().getEquipmentRenderer());
             }
         }
     }
@@ -126,6 +130,25 @@ public class TorqueClient {
         for (int i = 0; i < layers.size(); i++) {
             if (layers.get(i) instanceof CapeLayer) {
                 layers.set(i, new BentCapeLayer(renderer, context.getEquipmentAssets()));
+            }
+        }
+    }
+
+    /**
+     * 把原版鞘翅层换成 {@link TorqueWingsLayer}：它会在画鞘翅前叠上 {@code body} 的变换，
+     * 这样鞘翅就能跟着 {@code animation.fly} / {@code animation.hover} 的躯干微动一起晃。
+     *
+     * <p>装备层渲染器直接复用 {@code Context} 里那一份，位置留在原序号上，渲染顺序不变。
+     */
+    private static void useWingsLayer(
+        AvatarRenderer<AbstractClientPlayer> renderer,
+        EntityModelSet models,
+        EquipmentLayerRenderer equipmentRenderer
+    ) {
+        List<RenderLayer<AvatarRenderState, PlayerModel>> layers = renderer.layers;
+        for (int i = 0; i < layers.size(); i++) {
+            if (layers.get(i) instanceof WingsLayer<?, ?>) {
+                layers.set(i, new TorqueWingsLayer(renderer, models, equipmentRenderer));
             }
         }
     }

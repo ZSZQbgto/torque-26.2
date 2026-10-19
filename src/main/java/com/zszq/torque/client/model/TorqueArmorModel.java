@@ -41,8 +41,10 @@ public class TorqueArmorModel extends PlayerModel {
         // 所以这里也得按同一份动画摆一遍——不然蹲下时护腿和靴子会直挺挺地留在原地
         AnimationBridge.blendRotation(this.rightArm, state, "rightArm");
         AnimationBridge.blendPosition(this.rightArm, state, "rightArm");
+        AnimationBridge.addSwingArm(this.rightArm, state, "rightArm");
         AnimationBridge.blendRotation(this.leftArm, state, "leftArm");
         AnimationBridge.blendPosition(this.leftArm, state, "leftArm");
+        AnimationBridge.addSwingArm(this.leftArm, state, "leftArm");
         AnimationBridge.blendRotation(this.rightLeg, state, "rightLeg");
         AnimationBridge.blendPosition(this.rightLeg, state, "rightLeg");
         AnimationBridge.blendRotation(this.leftLeg, state, "leftLeg");
